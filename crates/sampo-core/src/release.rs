@@ -1005,43 +1005,43 @@ pub(crate) fn validate_dependency_constraints(
                 continue;
             };
 
-            let check_result = check_internal_dependency(
+            for check_result in check_internal_dependency(
                 pkg_info,
                 dep_info,
                 new_dep_version,
                 cargo_metadata.as_ref(),
-            )?;
+            )? {
+                match check_result {
+                    ConstraintCheckResult::Satisfied => {}
+                    ConstraintCheckResult::Skipped { .. } => {}
+                    ConstraintCheckResult::Unverifiable { constraint } => {
+                        warnings.push(unverifiable_pin_warning(
+                            pkg_id,
+                            &dep_info.name,
+                            &constraint,
+                            new_dep_version,
+                        ));
+                    }
+                    ConstraintCheckResult::NotSatisfied {
+                        constraint,
+                        new_version,
+                    } => {
+                        let violation = ConstraintViolation {
+                            dependent_identifier: pkg_id.clone(),
+                            dependency_identifier: dep_id.clone(),
+                            dependency_name: dep_info.name.clone(),
+                            constraint: constraint.clone(),
+                            new_version: new_version.clone(),
+                        };
 
-            match check_result {
-                ConstraintCheckResult::Satisfied => {}
-                ConstraintCheckResult::Skipped { .. } => {}
-                ConstraintCheckResult::Unverifiable { constraint } => {
-                    warnings.push(unverifiable_pin_warning(
-                        pkg_id,
-                        &dep_info.name,
-                        &constraint,
-                        new_dep_version,
-                    ));
-                }
-                ConstraintCheckResult::NotSatisfied {
-                    constraint,
-                    new_version,
-                } => {
-                    let violation = ConstraintViolation {
-                        dependent_identifier: pkg_id.clone(),
-                        dependency_identifier: dep_id.clone(),
-                        dependency_name: dep_info.name.clone(),
-                        constraint: constraint.clone(),
-                        new_version: new_version.clone(),
-                    };
+                        let is_fixed_or_linked = group_index(pkg_id, fixed_groups).is_some()
+                            || group_index(pkg_id, &linked_groups).is_some();
 
-                    let is_fixed_or_linked = group_index(pkg_id, fixed_groups).is_some()
-                        || group_index(pkg_id, &linked_groups).is_some();
-
-                    if is_fixed_or_linked {
-                        violations.push(violation);
-                    } else {
-                        warnings.push(format!("Warning: {}", violation));
+                        if is_fixed_or_linked {
+                            violations.push(violation);
+                        } else {
+                            warnings.push(format!("Warning: {}", violation));
+                        }
                     }
                 }
             }
@@ -1088,41 +1088,25 @@ pub(crate) fn validate_dependency_constraints(
     Ok(warnings)
 }
 
-/// A Cargo pin (bare `1.2.3` or exact `=1.2.3`) is skipped, as the release rewrites it to
-/// the new version. So is a requirement `cargo metadata` does not list.
+/// Checks the requirements this dependency will have after the release.
 fn check_internal_dependency(
     pkg_info: &PackageInfo,
     dep_info: &PackageInfo,
     new_dep_version: &str,
     cargo_metadata: Option<&ManifestMetadata>,
-) -> Result<ConstraintCheckResult> {
+) -> Result<Vec<ConstraintCheckResult>> {
     let adapter = PackageAdapter::from_kind(pkg_info.kind);
     let manifest_path = adapter.manifest_path(&pkg_info.path);
 
-    let constraint = match (pkg_info.kind, cargo_metadata) {
-        (PackageKind::Cargo, Some(meta)) => {
-            if meta.is_dependency_pinned(&manifest_path, &dep_info.name) {
-                return Ok(ConstraintCheckResult::Skipped {
-                    reason: "pinned version".to_string(),
-                });
-            }
-            let Some(constraint) = meta.get_dependency_constraint(&manifest_path, &dep_info.name)
-            else {
-                return Ok(ConstraintCheckResult::Skipped {
-                    reason: "requirement not found".to_string(),
-                });
-            };
-            constraint
-        }
-        _ => "*".to_string(),
-    };
-
-    adapter.check_dependency_constraint(
+    if let (PackageKind::Cargo, Some(metadata)) = (pkg_info.kind, cargo_metadata) {
+        return metadata.check_internal_dependency(&manifest_path, dep_info, new_dep_version);
+    }
+    Ok(vec![adapter.check_dependency_constraint(
         &manifest_path,
         &dep_info.name,
-        &constraint,
+        "*",
         new_dep_version,
-    )
+    )?])
 }
 
 /// Whether `dependent` can stay out of the release when `dependency` moves to `new_version`:
@@ -1143,10 +1127,10 @@ fn dependent_in_range(
     if dependent.kind == PackageKind::Cargo && cargo_metadata.is_none() {
         *cargo_metadata = Some(ManifestMetadata::load(ws)?);
     }
-    if !matches!(
-        check_internal_dependency(dependent, dependency, new_version, cargo_metadata.as_ref())?,
-        ConstraintCheckResult::Satisfied
-    ) {
+    if !check_internal_dependency(dependent, dependency, new_version, cargo_metadata.as_ref())?
+        .iter()
+        .all(|result| matches!(result, ConstraintCheckResult::Satisfied))
+    {
         return Ok(false);
     }
     // Hex rewrites every requirement it can parse, covered or not, so its rewrite says
